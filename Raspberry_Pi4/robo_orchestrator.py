@@ -18,6 +18,46 @@ Point the Pi at your laptop automatically — no IP to configure:
     On the Pi:      pip install mcp zeroconf
 This script finds the laptop via mDNS at startup (see
 discover_laptop_ollama below). Set NOVA_LAPTOP_HOST to override.
+
+── STT FIX NOTES (2026-07-14) ──────────────────────────────────────
+Field log showed energy_threshold was stable across calls (~4400-5500,
+nowhere near the 15000 ceiling) — so mis-hears were NOT caused by a
+bad calibration snapshot. The tell was capture duration: failed
+("couldn't understand it") turns clustered at long captures (10.9s,
+12.8s, close to phrase_time_limit=12s) while successful turns were
+short (2-4s). That means listen() often isn't finding 0.8s of
+continuous silence to end the phrase — something mid-capture (a noise
+burst: fan, servo settle, coil whine) is being read as "still
+speech" and dragging extra non-speech audio into what gets sent to
+STT, garbling it.
+
+Changes made below, in order of confidence:
+  1. dynamic_energy_adjustment_damping raised from SR's default 0.15
+     to 0.30 — makes the live threshold react more slowly to a brief
+     loud burst, so a one-off spike is less likely to get treated as
+     "the speaker got louder, raise the bar" and then fail to drop
+     back down before real silence follows.
+  2. adjust_for_ambient_noise duration restored to 0.5s (was 1.0s) —
+     the field data doesn't show this caused the current problem, but
+     there's no upside to holding a longer window right after
+     playback, and it reduces the chance the tail of Nova's own
+     speech gets folded into the "room noise" estimate.
+  3. Post-capture RMS of the actual returned AudioData is now logged
+     alongside capture_elapsed. This is DIAGNOSTIC, not a fix — it's
+     needed to confirm whether #1 actually shortened the long-capture
+     failures, since we don't have visibility into audio during
+     listen() itself with SR's blocking API.
+  4. pause_threshold nudged to 0.9s (was 0.8s) — small extra headroom
+     so a short benign gap doesn't get second-guessed as continued
+     speech once combined with change #1.
+
+None of this is guaranteed — it's the best-supported fix from the
+data collected so far, not a confirmed root cause. Watch the new RMS
+log line on the next real session: if long-capture mis-hears persist
+and their RMS is elevated throughout (not just spiking briefly), the
+noise-burst theory is wrong and the next thing to check is whether a
+trigger_gesture/servo call is overlapping the listening window.
+─────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -25,6 +65,7 @@ import re
 import json
 import time
 import socket
+import audioop
 import asyncio
 import threading
 import subprocess
@@ -177,25 +218,40 @@ def configure_audio_levels():
         print("    Check control names with: amixer -c RoboSpk controls")
 
 # ── MEMORY ────────────────────────────────────────────
-# Conversation history persists as JSON between runs, so Nova has
-# context from earlier sessions instead of waking up blank every time.
-# JSON (not CSV) because messages aren't flat rows — tool calls carry
-# nested arguments, and JSON keeps that structure intact for the model
-# to read back, where CSV would force it into a lossy flat string.
 MEMORY_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "nova_memory.json")
-MEMORY_MAX_MESSAGES = 40  # how much history the file keeps on disk, across all past sessions
-MEMORY_CONTEXT_MESSAGES = 12  # how much of that history actually gets loaded into a fresh
-                               # session's starting context — kept separate from the file cap
-                               # above so "does Nova remember past sessions" (yes, up to 40) and
-                               # "how much does every single model call have to re-process"
-                               # (much less, 12) are two independent knobs, not the same one.
+MEMORY_MAX_MESSAGES = 40
+MEMORY_CONTEXT_MESSAGES = 12
 
-# How long to wait in silence for the child to start talking at all,
-# vs. the hard cap on a single utterance once they do start (see
-# pause_threshold inside get_voice_input for what actually ends a
-# phrase early — 0.8s of silence after speech, not this cap).
 SESSION_LISTEN_TIMEOUT     = 30
-SESSION_PHRASE_TIME_LIMIT  = 12  # was 8 — a bit more headroom for longer kid sentences
+SESSION_PHRASE_TIME_LIMIT  = 12
+MAX_MISHEARD_RETRIES       = 3  # consecutive "heard something, couldn't understand it" attempts
+                                 # before giving up and ending the session — without this cap,
+                                 # background noise sitting at the calibrated threshold can trigger
+                                 # false speech-detected loops that never end on their own
+
+# dynamic_energy_threshold recalibrates every call based on what it just
+# heard. Field logs show this room's real ambient noise floor sits
+# around 3500-6000 RMS (Pi fan + USB audio hardware noise) — so a
+# calibrated threshold in that range is accurate, not broken. Clamping
+# it down to some fixed "quiet room" value would do the opposite of
+# what's needed: it would make the mic treat that real ambient noise as
+# speech. ENERGY_THRESHOLD_CEILING below is a diagnostic tripwire for a
+# truly pathological spike (e.g. something briefly very loud right next
+# to the mic), not a normal-operation clamp.
+ENERGY_THRESHOLD_CEILING   = 15000
+
+# Gives any acoustic reverb/echo from RoboSpk's just-finished playback a
+# moment to fully decay in the room before the mic starts sampling
+# ambient noise for calibration — without this, the calibration step
+# right after Nova finishes speaking can pick up her own trailing audio
+# as "the room's noise floor" and calibrate too high.
+POST_SPEECH_SETTLE_S       = 0.5
+
+# How long adjust_for_ambient_noise() samples before every listen().
+# Restored to 0.5s (was 1.0s) — field data didn't show this caused the
+# mis-hear problem, but a shorter window still reduces the odds of
+# folding in a stray noise event, and gets the mic listening sooner.
+AMBIENT_CALIBRATION_S      = 0.5
 
 
 def _json_default(o):
@@ -218,9 +274,6 @@ def load_memory() -> list:
 
 def save_memory(messages: list):
     try:
-        # Never persist the system prompt itself here — it's re-added
-        # fresh from SYSTEM_PROMPT on every startup in build_initial_messages,
-        # so an old saved copy can't go stale and override a future edit.
         trimmed = [m for m in messages if m.get("role") != "system"][-MEMORY_MAX_MESSAGES:]
         with open(MEMORY_FILE, "w") as f:
             json.dump(trimmed, f, indent=2, default=_json_default)
@@ -253,7 +306,17 @@ SYSTEM_PROMPT = (
     "You have no voice and no face of your own except through tools — "
     "you MUST call the speak tool to say anything out loud, plain text "
     "replies are never heard. Use set_emotion and trigger_gesture when "
-    "they fit what you're saying. Keep spoken sentences short and simple. "
+    "they fit what you're saying. "
+    "Never use emojis in the speak text — the robot's voice reads them "
+    "out loud as strange sounds, which confuses the child. Express "
+    "excitement or feeling through set_emotion and trigger_gesture "
+    "instead, and through the words themselves. "
+    "Every spoken reply must be ONE short sentence, under 12 words. No "
+    "exceptions — not two sentences, not a sentence plus a question, "
+    "just one short sentence. Longer replies take much longer to "
+    "actually speak out loud, which the child experiences as Nova "
+    "going quiet and unresponsive. Say the single most important thing "
+    "and stop. "
     "Call speak only ONCE per turn — say one thing, then stop and wait "
     "for the child to respond. Do not chain multiple things to say in a "
     "row; if you have more to say, save it for after they reply. "
@@ -262,7 +325,7 @@ SYSTEM_PROMPT = (
 )
 
 
-# ── VOICE INPUT (unchanged from the Pi-local version) ─
+# ── VOICE INPUT ────────────────────────────────────────
 def find_mic_device_index() -> int:
     mic_card_num = None
     try:
@@ -287,62 +350,84 @@ def find_mic_device_index() -> int:
 
 MIC_DEVICE_INDEX = find_mic_device_index()
 
-def get_voice_input(timeout: int = 8, phrase_time_limit: int = 4) -> str:
-    r = sr.Recognizer()
-    # Dynamic (not a hardcoded number) — auto-calibrates to whatever the
-    # room actually sounds like right now. A fixed energy_threshold=50
-    # was tuned back when RoboMic's gain was still near 100%; now that
-    # gain is correctly forced down to 10/28, that number no longer
-    # matches the real noise floor, which is exactly why pause_threshold
-    # was never detecting silence and capture kept hitting the
-    # phrase_time_limit ceiling on every single call regardless of how
-    # long you actually spoke.
-    r.dynamic_energy_threshold = True
-    r.pause_threshold = 0.8
+# Created once, reused across every call — dynamic_energy_threshold only
+# actually stabilizes if it gets to see audio across many calls over time.
+_recognizer = sr.Recognizer()
+_recognizer.dynamic_energy_threshold = True
+_recognizer.pause_threshold = 0.9  # was 0.8 — small extra headroom, see STT FIX NOTES above
+# Default is 0.15. Raising this makes the live energy threshold react
+# MORE SLOWLY to a sudden loud burst mid-capture (fan surge, servo
+# settle, coil whine) — the working theory for why some captures were
+# running out to phrase_time_limit instead of ending on real silence.
+_recognizer.dynamic_energy_adjustment_damping = 0.30
+
+
+def _rms_of_audiodata(audio: "sr.AudioData") -> float:
+    """Best-effort RMS of the captured AudioData, for diagnostic
+    logging only — lets us see, after the fact, whether a long capture
+    was long because of sustained noise throughout (bad calibration /
+    genuinely noisy room) vs. a brief burst (supports the damping fix)
+    vs. actual continued speech (kid just talked for a while, not a
+    bug at all)."""
+    try:
+        return audioop.rms(audio.get_raw_data(), audio.sample_width)
+    except Exception:
+        return -1.0
+
+
+def get_voice_input(timeout: int = 8, phrase_time_limit: int = 4) -> str | None:
+    """Returns the transcribed text, None if nobody spoke at all within
+    timeout (true silence), or "" if speech was captured but couldn't
+    be transcribed (background noise, mumbling, STT hiccup). That
+    distinction matters to the caller: real silence should end a
+    session, a failed transcription should just prompt a retry."""
     mic = sr.Microphone(device_index=MIC_DEVICE_INDEX, sample_rate=48000)
     t0 = time.monotonic()
     try:
         with mic as source:
-            r.adjust_for_ambient_noise(source, duration=0.3)
-            audio = r.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
+            _recognizer.adjust_for_ambient_noise(source, duration=AMBIENT_CALIBRATION_S)
+            if _recognizer.energy_threshold > ENERGY_THRESHOLD_CEILING:
+                print(f"⚠️  energy_threshold {_recognizer.energy_threshold:.0f} is unusually "
+                      f"high (ceiling {ENERGY_THRESHOLD_CEILING}) — leaving it as calibrated, "
+                      f"just flagging in case this session sounds off")
+            print(f"   [mic] energy_threshold={_recognizer.energy_threshold:.0f}")
+            audio = _recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_time_limit)
     except sr.WaitTimeoutError:
-        return ""
+        return None  # true silence — nobody started speaking at all
     capture_elapsed = time.monotonic() - t0
+    capture_rms = _rms_of_audiodata(audio)
+    ran_full_length = capture_elapsed >= (phrase_time_limit - 0.5)
+    if ran_full_length:
+        print(f"⚠️  capture ran ~to phrase_time_limit ({capture_elapsed:.1f}s / "
+              f"{phrase_time_limit}s) — either genuinely long speech, or listen() "
+              f"never found {_recognizer.pause_threshold}s of silence. "
+              f"captured_rms={capture_rms:.0f}")
     t1 = time.monotonic()
     try:
-        text = r.recognize_google(audio, language="en-IN")
+        text = _recognizer.recognize_google(audio, language="en-IN")
         stt_elapsed = time.monotonic() - t1
-        print(f"You said: {text}   [capture={capture_elapsed:.1f}s, stt={stt_elapsed:.1f}s]")
+        print(f"You said: {text}   [capture={capture_elapsed:.1f}s, stt={stt_elapsed:.1f}s, "
+              f"rms={capture_rms:.0f}]")
         return text.strip()
-    except (sr.UnknownValueError, Exception) as e:
+    except sr.UnknownValueError:
         stt_elapsed = time.monotonic() - t1
-        print(f"🎤 Voice error: {e}   [capture={capture_elapsed:.1f}s, stt={stt_elapsed:.1f}s]")
+        print(f"🎤 Heard something but couldn't understand it   "
+              f"[capture={capture_elapsed:.1f}s, stt={stt_elapsed:.1f}s, rms={capture_rms:.0f}]")
+        return ""  # captured audio, just not intelligible — not silence
+    except Exception as e:
+        stt_elapsed = time.monotonic() - t1
+        print(f"🎤 Voice error: {e}   [capture={capture_elapsed:.1f}s, stt={stt_elapsed:.1f}s, "
+              f"rms={capture_rms:.0f}]")
         return ""
 
 
 def downsample_48k_to_16k(chunk: np.ndarray) -> np.ndarray:
-    """Cheap 3:1 downsample via block-averaging, which also acts as a
-    simple low-pass filter to reduce aliasing before decimating — good
-    enough for wake-word feature extraction without adding a scipy
-    dependency for a proper resampler."""
     n = len(chunk) - (len(chunk) % DOWNSAMPLE_FACTOR)
     trimmed = chunk[:n].astype(np.int32)
     return trimmed.reshape(-1, DOWNSAMPLE_FACTOR).mean(axis=1).astype(np.int16)
 
 
 def listen_for_wake_word(oww_model) -> bool:
-    """Streams mic audio at its native 48kHz, downsamples to the 16kHz
-    openWakeWord expects, and returns True the moment the wake word's
-    confidence score crosses OWW_THRESHOLD. Fully offline, no per-cycle
-    Google STT calls. Follow-up conversation within an active session
-    still uses Google STT via get_voice_input() as before.
-
-    Doesn't assume the prediction dict's key is literally "hey_nova" —
-    that depends on how the model was named/trained and isn't worth
-    guessing wrong silently. Instead it takes the highest-scoring key
-    each frame, whatever it's called, and logs scores periodically so
-    you can see real numbers while testing rather than a silent
-    "not responding"."""
     p = pyaudio.PyAudio()
     stream = p.open(
         format=pyaudio.paInt16,
@@ -366,7 +451,7 @@ def listen_for_wake_word(oww_model) -> bool:
                 best_name, best_score = None, 0.0
 
             frame_count += 1
-            if frame_count % 12 == 0:  # roughly once a second — enough to watch live, not spammy
+            if frame_count % 12 == 0:
                 peak = int(np.abs(audio_48k).max())
                 rms = float(np.sqrt(np.mean(audio_48k.astype(np.float64) ** 2)))
                 print(f"   [audio] peak={peak:5d} rms={rms:7.1f}   [wake scores] {prediction}")
@@ -381,22 +466,12 @@ def listen_for_wake_word(oww_model) -> bool:
 
 
 def load_oww_model():
-    """openwakeword's Model() constructor signature has changed across
-    package versions — some expect wakeword_model_paths (and infer the
-    inference framework from the file extension), older ones expect
-    wakeword_models plus an explicit inference_framework. Try the newer
-    signature first, fall back to the older one, so this works
-    regardless of which version got installed."""
     try:
         return OWWModel(wakeword_model_paths=[OWW_MODEL_PATH])
     except TypeError:
         return OWWModel(wakeword_models=[OWW_MODEL_PATH], inference_framework="onnx")
 
-# ── TOOL SCHEMA CONVERSION (MCP -> Ollama) ─────────────
 def mcp_tools_to_ollama_schema(mcp_tools) -> list:
-    # Tools prefixed with "_" are internal/system tools (e.g. the
-    # listening indicator) — the orchestrator calls them directly via
-    # session.call_tool(), but they're never offered to the model.
     return [
         {
             "type": "function",
@@ -410,10 +485,6 @@ def mcp_tools_to_ollama_schema(mcp_tools) -> list:
         if not t.name.startswith("_")
     ]
 
-# ── FALLBACK: catch a tool call the model wrote as text ─
-# Some smaller models occasionally dump {"name": ..., "arguments": {...}}
-# into message.content instead of using native tool_calls. If that
-# happens, we try to salvage it rather than silently ignoring the turn.
 def salvage_text_tool_call(content: str) -> dict | None:
     if not content:
         return None
@@ -425,7 +496,6 @@ def salvage_text_tool_call(content: str) -> dict | None:
     except Exception:
         return None
 
-# ── AGENT LOOP ─────────────────────────────────────────
 async def run_turn(session: ClientSession, ollama_tools: list, messages: list):
     for round_num in range(MAX_TOOL_ROUNDS):
         t0 = time.monotonic()
@@ -451,8 +521,6 @@ async def run_turn(session: ClientSession, ollama_tools: list, messages: list):
             if salvaged:
                 tool_calls = [{"function": salvaged}]
             else:
-                # Model produced plain text with no tool call — nudge it,
-                # since speech must go through the speak tool.
                 if msg.get("content"):
                     messages.append({
                         "role": "user",
@@ -483,13 +551,9 @@ async def run_turn(session: ClientSession, ollama_tools: list, messages: list):
             })
 
         if any(c["function"]["name"] == "end_session" for c in tool_calls):
-            return True  # session ended, stop the outer loop too
+            return True
 
         if any(c["function"]["name"] == "speak" for c in tool_calls):
-            # She's said her one thing for this turn — stop here and hand
-            # control back to listening, rather than letting the model
-            # chain a second speak() (and a second TTS playback) before
-            # the child gets a chance to respond.
             return False
 
     return False
@@ -497,17 +561,8 @@ async def run_turn(session: ClientSession, ollama_tools: list, messages: list):
 
 async def run_active_session(session: ClientSession, ollama_tools: list, messages: list,
                               first_input: str | None = None) -> bool:
-    """Runs one active listening session: no wake word needed for
-    follow-ups, each listen waits up to 30s, and 30s of silence quietly
-    ends the session (back to sleep, no shutdown). Returns True if the
-    model called end_session during this session (caller should stop
-    the whole program), False otherwise.
-
-    first_input lets a session open with something already said —
-    used both for a same-breath wake-word follow-up (if that's ever
-    reintroduced) and for the startup greeting opening its own
-    listening window without requiring "Hey Nova" first."""
     pending_input = first_input
+    misheard_streak = 0
 
     while True:
         if pending_input:
@@ -518,14 +573,32 @@ async def run_active_session(session: ClientSession, ollama_tools: list, message
             # thinking or while she's talking, so the face honestly
             # reflects "listening now" rather than "session is active."
             await session.call_tool("_set_listening_indicator", {"active": True})
+            time.sleep(POST_SPEECH_SETTLE_S)  # let any speaker echo decay before calibrating
             user_input = get_voice_input(timeout=SESSION_LISTEN_TIMEOUT,
                                           phrase_time_limit=SESSION_PHRASE_TIME_LIMIT)
             await session.call_tool("_set_listening_indicator", {"active": False})
 
-        if not user_input:
+        if user_input is None:
             print("😴 30s of silence — session ending, back to sleep.")
+            # Ears off (above) and face back to a resting expression —
+            # otherwise the OLED is left showing whatever emotion the
+            # last spoken line set, even though Nova is no longer
+            # actively listening or engaged.
+            await session.call_tool("set_emotion", {"emotion": "neutral"})
             return False
 
+        if user_input == "":
+            misheard_streak += 1
+            if misheard_streak >= MAX_MISHEARD_RETRIES:
+                print(f"😴 {misheard_streak} misheard attempts in a row — "
+                      f"giving up for now, back to sleep.")
+                await session.call_tool("set_emotion", {"emotion": "neutral"})
+                return False
+            print(f"🎤 Didn't catch that — listening again "
+                  f"({misheard_streak}/{MAX_MISHEARD_RETRIES}).")
+            continue
+
+        misheard_streak = 0
         messages.append({"role": "user", "content": user_input})
         save_memory(messages)
 
@@ -550,6 +623,7 @@ async def main():
     server_params = StdioServerParameters(
         command="python3",
         args=["mcp_tools_server.py"],
+        env=os.environ.copy(),
     )
 
     async with stdio_client(server_params) as (read, write):
@@ -567,17 +641,11 @@ async def main():
             await session.call_tool("trigger_gesture", {"gesture": "wave"})
             await session.call_tool("speak", {"text": greeting})
 
-            # The startup greeting opens its own 30s listening session,
-            # same as a wake word would — no need to say "Hey Nova"
-            # again if the child responds right away.
             print("👂 Listening for a response to the startup greeting...")
             ended = await run_active_session(session, ollama_tools, messages)
 
             while not ended:
                 try:
-                    # SLEEPING: continuously streaming audio through
-                    # openWakeWord until the wake word fires. Nothing
-                    # here reaches the model or Google STT.
                     listen_for_wake_word(oww_model)
 
                     print("👂 Wake word detected: Hey Nova — session active")
