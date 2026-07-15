@@ -58,6 +58,45 @@ and their RMS is elevated throughout (not just spiking briefly), the
 noise-burst theory is wrong and the next thing to check is whether a
 trigger_gesture/servo call is overlapping the listening window.
 ─────────────────────────────────────────────────────────────────────
+
+── "COMFORTABLE TURN-TAKING" FIX NOTES (2026-07-15) ────────────────
+Field feedback described two distinct, compounding problems that made
+talking to Nova feel stressful — like the child had to watch for a
+narrow window to speak in:
+
+  A. "Sometimes it doesn't pick it up, I have to say it again."
+     Root cause: there was a silent dead zone between the ears
+     visually turning on and the mic actually being ready — the
+     POST_SPEECH_SETTLE_S sleep plus AMBIENT_CALIBRATION_S ran before
+     listen() even started, with zero signal to the child that this
+     gap was happening. If they started talking right as the ears
+     icon appeared, those first words were spoken into dead air.
+
+  B. "Ears turn off in the middle of speaking, cuts off mid-sentence."
+     Root cause: pause_threshold=0.9s is tuned for adult speech
+     cadence. A child thinking mid-sentence routinely pauses longer
+     than that, so listen() was reading a normal thinking-pause as
+     "they're done" and ending the phrase early.
+
+Fixes:
+  1. pause_threshold raised 0.9s -> 1.6s, and non_speaking_duration
+     added at 0.6s. Together these give real thinking-pauses room
+     without needing the (much longer) phrase_time_limit to be the
+     only thing capping a turn.
+  2. SESSION_PHRASE_TIME_LIMIT raised 12s -> 18s to match the longer
+     pause_threshold — otherwise the outer time limit would just
+     become the new premature cutoff.
+  3. The pre-listen "settle" sleep is now skipped when nothing was
+     just played (e.g. right after a wake-word detection, as opposed
+     to right after Nova finished speaking) — see
+     settle_before_first_listen below. This removes most of the dead
+     zone that caused problem A in the first place.
+  4. An audible "go ahead, I'm listening" chirp now plays the instant
+     the ears turn on (see mcp_tools_server.py's
+     _set_listening_indicator), the same pattern Google/Alexa use, so
+     the child gets an unambiguous cue instead of having to watch for
+     a visual icon while distracted mid-play.
+─────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -222,8 +261,11 @@ MEMORY_FILE         = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 MEMORY_MAX_MESSAGES = 40
 MEMORY_CONTEXT_MESSAGES = 12
 
+# Raised 12s -> 18s alongside the longer pause_threshold below — the
+# outer time limit needs headroom too, or it just becomes the new
+# premature cutoff instead of pause_threshold.
 SESSION_LISTEN_TIMEOUT     = 30
-SESSION_PHRASE_TIME_LIMIT  = 12
+SESSION_PHRASE_TIME_LIMIT  = 18
 MAX_MISHEARD_RETRIES       = 3  # consecutive "heard something, couldn't understand it" attempts
                                  # before giving up and ending the session — without this cap,
                                  # background noise sitting at the calibrated threshold can trigger
@@ -245,6 +287,12 @@ ENERGY_THRESHOLD_CEILING   = 15000
 # ambient noise for calibration — without this, the calibration step
 # right after Nova finishes speaking can pick up her own trailing audio
 # as "the room's noise floor" and calibrate too high.
+#
+# NOTE: this settle sleep is now SKIPPED when nothing was just played
+# (e.g. right after wake-word detection) — see settle_before_first_listen
+# in run_active_session(). It's still applied after the startup greeting
+# and after every one of Nova's own spoken turns, where the echo risk is
+# real.
 POST_SPEECH_SETTLE_S       = 0.5
 
 # How long adjust_for_ambient_noise() samples before every listen().
@@ -354,7 +402,15 @@ MIC_DEVICE_INDEX = find_mic_device_index()
 # actually stabilizes if it gets to see audio across many calls over time.
 _recognizer = sr.Recognizer()
 _recognizer.dynamic_energy_threshold = True
-_recognizer.pause_threshold = 0.9  # was 0.8 — small extra headroom, see STT FIX NOTES above
+# Raised 0.9s -> 1.6s (see "COMFORTABLE TURN-TAKING" notes above). A
+# child thinking mid-sentence routinely pauses longer than adult
+# cadence; 0.9s was reading that as "done talking" and cutting them off
+# mid-thought.
+_recognizer.pause_threshold = 1.6
+# New: keeps a little trailing silence in the capture itself, softening
+# exactly where the cutoff lands rather than only changing when it
+# triggers.
+_recognizer.non_speaking_duration = 0.6
 # Default is 0.15. Raising this makes the live energy threshold react
 # MORE SLOWLY to a sudden loud burst mid-capture (fan surge, servo
 # settle, coil whine) — the working theory for why some captures were
@@ -560,9 +616,24 @@ async def run_turn(session: ClientSession, ollama_tools: list, messages: list):
 
 
 async def run_active_session(session: ClientSession, ollama_tools: list, messages: list,
-                              first_input: str | None = None) -> bool:
+                              first_input: str | None = None,
+                              settle_before_first_listen: bool = True) -> bool:
+    """
+    settle_before_first_listen: whether to apply POST_SPEECH_SETTLE_S
+    before the very FIRST listen() call of this session. Pass False
+    when nothing was just played through RoboSpk (e.g. right after a
+    wake-word detection) — there's no echo to let decay, so that sleep
+    was pure dead air the child had to wait through before the mic
+    actually opened. Pass True (the default) right after Nova has
+    spoken — the startup greeting, or any turn where run_turn() just
+    called speak() — where the echo-decay reasoning still applies.
+    Every listen() after the first one in a session still gets the
+    settle, since by then Nova's tool calls (speak, gestures) may have
+    played audio in between.
+    """
     pending_input = first_input
     misheard_streak = 0
+    is_first_listen = True
 
     while True:
         if pending_input:
@@ -572,11 +643,16 @@ async def run_active_session(session: ClientSession, ollama_tools: list, message
             # Ears on only for the actual capture window — not while
             # thinking or while she's talking, so the face honestly
             # reflects "listening now" rather than "session is active."
+            # The tool call itself also fires the audible "go ahead"
+            # chirp (see mcp_tools_server.py) at the exact moment the
+            # mic is about to open.
             await session.call_tool("_set_listening_indicator", {"active": True})
-            time.sleep(POST_SPEECH_SETTLE_S)  # let any speaker echo decay before calibrating
+            if not (is_first_listen and not settle_before_first_listen):
+                time.sleep(POST_SPEECH_SETTLE_S)  # let any speaker echo decay before calibrating
             user_input = get_voice_input(timeout=SESSION_LISTEN_TIMEOUT,
                                           phrase_time_limit=SESSION_PHRASE_TIME_LIMIT)
             await session.call_tool("_set_listening_indicator", {"active": False})
+            is_first_listen = False
 
         if user_input is None:
             print("😴 30s of silence — session ending, back to sleep.")
@@ -642,6 +718,7 @@ async def main():
             await session.call_tool("speak", {"text": greeting})
 
             print("👂 Listening for a response to the startup greeting...")
+            # Nova just spoke the greeting — echo-decay settle is warranted here.
             ended = await run_active_session(session, ollama_tools, messages)
 
             while not ended:
@@ -649,7 +726,11 @@ async def main():
                     listen_for_wake_word(oww_model)
 
                     print("👂 Wake word detected: Hey Nova — session active")
-                    ended = await run_active_session(session, ollama_tools, messages)
+                    # Nothing was just played through RoboSpk — skip the
+                    # settle sleep on the first listen so the mic opens
+                    # (and the "go ahead" chirp fires) immediately.
+                    ended = await run_active_session(session, ollama_tools, messages,
+                                                      settle_before_first_listen=False)
 
                 except KeyboardInterrupt:
                     print("\n👋 Interrupted — shutting down loop.")
