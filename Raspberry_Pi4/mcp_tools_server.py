@@ -12,6 +12,18 @@ actually invokes them here.
 Run standalone for testing:
     python3 mcp_tools_server.py
 Normally it's spawned as a subprocess by robo_orchestrator.py over stdio.
+
+── LISTEN-CUE NOTES (2026-07-15) ───────────────────────────────────
+Field feedback: kids couldn't tell when the mic actually opened, so they'd
+start talking too early (lost to the pre-listen dead zone) or just stand
+there unsure, "in stress" waiting for a cue that never came. Google/Alexa
+solve this with a short audible chime the instant capture starts — added
+that here as _generate_listen_cue() + a chirp played from
+_set_listening_indicator(active=True), right alongside the ears-up visual.
+Generated once at import time (same reasoning as the resident Piper voice:
+don't redo cheap-but-not-free work on every single call) and played via a
+backgrounded aplay so it never blocks the tool-call response.
+─────────────────────────────────────────────────────────────────────
 """
 
 import os
@@ -24,6 +36,7 @@ import subprocess
 os.environ['JACK_NO_AUDIO_RESERVATION'] = '1'
 os.environ['JACK_NO_START_SERVER'] = '1'
 
+import numpy as np
 import serial
 from mcp.server.fastmcp import FastMCP
 
@@ -118,6 +131,49 @@ def strip_emoji(text: str) -> str:
     # Emoji removal can leave doubled-up spaces or trailing whitespace
     # ("Let's play!  " after stripping "🎯🚀✨") — collapse those too.
     return re.sub(r"\s+", " ", cleaned).strip()
+
+
+# ── LISTEN CUE (the "go ahead, I'm listening" chirp) ────
+# Short two-tone rising chirp, generated once at import time and reused
+# on every _set_listening_indicator(active=True) call — this is the same
+# "just go ahead and talk" moment Google/Alexa devices signal with a
+# chime, so the child never has to guess whether the mic is actually
+# open yet.
+_LISTEN_CUE_PATH = "/tmp/listen_cue.wav"
+_LISTEN_CUE_SR = 48000  # matches RoboSpk's native rate, no resample needed
+
+
+def _generate_listen_cue():
+    def tone(freq, dur):
+        t = np.linspace(0, dur, int(_LISTEN_CUE_SR * dur), endpoint=False)
+        # Fast fade-in/out on each tone so the chirp doesn't click/pop.
+        fade = 0.008
+        envelope = np.minimum(t / fade, (dur - t) / fade).clip(0, 1)
+        return np.sin(2 * np.pi * freq * t) * envelope * 0.35
+
+    chirp = np.concatenate([tone(523, 0.09), tone(784, 0.11)])  # C5 -> G5, "ready" feel
+    pcm = (chirp * 32767).astype(np.int16)
+    try:
+        with wave.open(_LISTEN_CUE_PATH, "wb") as f:
+            f.setnchannels(1)
+            f.setsampwidth(2)
+            f.setframerate(_LISTEN_CUE_SR)
+            f.writeframes(pcm.tobytes())
+        log(f"✅ Listen cue generated: {_LISTEN_CUE_PATH}")
+    except Exception as e:
+        log(f"⚠️  Could not generate listen cue ({e}) — ears-up will be silent")
+
+
+_generate_listen_cue()
+
+
+def play_listen_cue():
+    """Fire-and-forget playback — backgrounded with '&' so this never
+    blocks the MCP tool response back to the orchestrator. The chirp is
+    ~200ms; by the time ambient-noise calibration finishes on the
+    orchestrator side, it's long done playing."""
+    if os.path.exists(_LISTEN_CUE_PATH):
+        os.system(f"aplay -D plughw:RoboSpk,0 {_LISTEN_CUE_PATH} 2>/dev/null &")
 
 
 mcp = FastMCP("robo-actions")
@@ -264,8 +320,14 @@ def end_session(farewell_text: str) -> str:
 def _set_listening_indicator(active: bool) -> str:
     """Internal system tool — not for model use. Called by the
     orchestrator (not the model) to toggle the listening-ears overlay
-    on the face while capturing audio after the wake word."""
+    on the face while capturing audio after the wake word. When turning
+    ON, also plays a short audible cue — the same "go ahead, I'm
+    listening now" chime pattern used by Google/Alexa devices — so the
+    child gets both a visual and an audible signal for exactly when to
+    start talking, instead of having to guess."""
     serial_send("LISTEN_ON" if active else "LISTEN_OFF")
+    if active:
+        play_listen_cue()
     return "ok"
 
 
